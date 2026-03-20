@@ -4,15 +4,12 @@ const { WebSocketServer } = require('ws');
 const app = express();
 const port = process.env.PORT || 8080;
 
-// Render.com braucht einen normalen HTTP-Endpunkt (eine Webseite), um zu prüfen, ob der Server online ist.
-app.get('/', (req, res) => res.send('GA Relay Server läuft! 🚀'));
-
+app.get('/', (req, res) => res.send('GA Relay Server (Secured) läuft! 🚀'));
 const server = app.listen(port, () => console.log(`Server lauscht auf Port ${port}`));
 
-// WebSocket Server an den HTTP Server binden
 const wss = new WebSocketServer({ server });
 
-// Hier speichern wir, wer in welchem "Raum" (Sync ID) ist
+// Speichert für jeden Raum die verbundenen Clients UND den gültigen PIN
 const rooms = new Map();
 
 wss.on('connection', (ws) => {
@@ -20,25 +17,35 @@ wss.on('connection', (ws) => {
         try {
             const data = JSON.parse(messageAsString);
             const syncId = data.syncId;
+            const incomingPin = data.pin || ''; // PIN aus der Payload lesen
 
             if (!syncId) return;
 
-            // Raum erstellen, falls er noch nicht existiert
+            // Raum erstellen, falls er noch nicht existiert (Der erste setzt das Passwort)
             if (!rooms.has(syncId)) {
-                rooms.set(syncId, new Set());
+                rooms.set(syncId, { clients: new Set(), pin: incomingPin });
             }
 
-            // 1. Ein Gerät betritt den Raum (Handy oder MSFS)
+            const room = rooms.get(syncId);
+
+            // PIN PRÜFUNG (Türsteher)
+            // Wenn der Raum schon existiert und der einkommende PIN nicht passt -> RAUSWURF
+            if (room.pin && room.pin !== incomingPin) {
+                console.log(`Zugriff verweigert für ID: ${syncId} (Falscher PIN)`);
+                ws.send(JSON.stringify({ type: 'error', message: 'Falscher PIN für diesen Tracker-Raum' }));
+                ws.close(); // Verbindung knallhart beenden
+                return;
+            }
+
+            // 1. Gerät betritt den Raum
             if (data.type === 'join') {
-                rooms.get(syncId).add(ws);
+                room.clients.add(ws);
                 console.log(`Neues Gerät in Raum ${syncId} beigetreten.`);
             }
 
-            // 2. Ein Gerät funkt GPS-Daten -> An alle ANDEREN im Raum weiterleiten
+            // 2. Gerät funkt GPS-Daten
             if (data.type === 'gps') {
-                const room = rooms.get(syncId);
-                room.forEach(client => {
-                    // Nicht an sich selbst zurückschicken und prüfen ob Verbindung noch offen ist (1)
+                room.clients.forEach(client => {
                     if (client !== ws && client.readyState === 1) {
                         client.send(JSON.stringify(data));
                     }
@@ -49,11 +56,13 @@ wss.on('connection', (ws) => {
         }
     });
 
-    // Wenn ein Gerät offline geht, aufräumen
     ws.on('close', () => {
-        rooms.forEach((clients, syncId) => {
-            clients.delete(ws);
-            if (clients.size === 0) rooms.delete(syncId);
+        rooms.forEach((roomData, syncId) => {
+            roomData.clients.delete(ws);
+            // Wenn der Raum leer ist, wird er gelöscht (und der PIN resettet sich)
+            if (roomData.clients.size === 0) {
+                rooms.delete(syncId);
+            }
         });
     });
 });
