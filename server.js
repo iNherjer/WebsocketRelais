@@ -1,9 +1,12 @@
 const express = require('express');
 const { WebSocket, WebSocketServer } = require('ws');
+const { gzipSync } = require('node:zlib');
 
 const DEFAULT_TELEMETRY_INTERVAL_MS = 500;
 const COMPRESSION_THRESHOLD_BYTES = 512;
 const STATS_INTERVAL_MS = 60_000;
+const RELAY_GZIP_CAPABILITY = 'gzip-base64-v1';
+const RELAY_GZIP_MESSAGE_TYPE = 'relay_compressed';
 
 function positiveNumber(value, fallback) {
     const parsed = Number(value);
@@ -29,6 +32,21 @@ function isRealtimeTelemetry(data) {
 function mergePendingTelemetry(previous, latest) {
     if (!previous || !Array.isArray(previous.traffic) || Array.isArray(latest?.traffic)) return latest;
     return { ...latest, traffic: previous.traffic };
+}
+
+function acceptsRelayGzip(data) {
+    return Array.isArray(data?.relayCapabilities)
+        && data.relayCapabilities.includes(RELAY_GZIP_CAPABILITY);
+}
+
+function createGzipEnvelope(serialized, originalType = '') {
+    const payload = gzipSync(Buffer.from(serialized, 'utf8'), { level: 3 }).toString('base64');
+    return JSON.stringify({
+        type: RELAY_GZIP_MESSAGE_TYPE,
+        encoding: RELAY_GZIP_CAPABILITY,
+        originalType: String(originalType || ''),
+        payload
+    });
 }
 
 function createRelayServer(options = {}) {
@@ -57,6 +75,10 @@ function createRelayServer(options = {}) {
         forwardedMessages: 0,
         outboundCopies: 0,
         outboundBytesBeforeCompression: 0,
+        outboundWireBytes: 0,
+        gzipCopies: 0,
+        gzipBytesSaved: 0,
+        gzipErrors: 0,
         coalescedTelemetry: 0
     };
 
@@ -69,11 +91,36 @@ function createRelayServer(options = {}) {
     const broadcast = (sender, room, data) => {
         const serialized = JSON.stringify(data);
         const bytes = Buffer.byteLength(serialized, 'utf8');
+        const recipients = [...room.clients].filter(
+            client => client !== sender && client.readyState === WebSocket.OPEN
+        );
+        const gzipRecipients = isRealtimeTelemetry(data)
+            ? recipients.filter(client => client.relayAcceptsGzip === true)
+            : [];
+        let gzipSerialized = null;
+        let gzipBytes = 0;
+        if (gzipRecipients.length > 0 && bytes >= COMPRESSION_THRESHOLD_BYTES) {
+            try {
+                const candidate = createGzipEnvelope(serialized, data.type);
+                const candidateBytes = Buffer.byteLength(candidate, 'utf8');
+                if (candidateBytes < bytes) {
+                    gzipSerialized = candidate;
+                    gzipBytes = candidateBytes;
+                }
+            } catch (error) {
+                stats.gzipErrors += 1;
+                logger.error('Relay-Gzip fehlgeschlagen; sende Legacy-JSON:', error);
+            }
+        }
         let copies = 0;
-        room.clients.forEach(client => {
-            if (client !== sender && client.readyState === WebSocket.OPEN) {
-                client.send(serialized);
-                copies += 1;
+        recipients.forEach(client => {
+            const useGzip = gzipSerialized && client.relayAcceptsGzip === true;
+            client.send(useGzip ? gzipSerialized : serialized);
+            copies += 1;
+            stats.outboundWireBytes += useGzip ? gzipBytes : bytes;
+            if (useGzip) {
+                stats.gzipCopies += 1;
+                stats.gzipBytesSaved += bytes - gzipBytes;
             }
         });
         stats.forwardedMessages += 1;
@@ -116,6 +163,7 @@ function createRelayServer(options = {}) {
         ws.relayTelemetryLastSentAt = 0;
         ws.relayTelemetryPending = null;
         ws.relayTelemetryTimer = null;
+        ws.relayAcceptsGzip = false;
 
         ws.on('message', (messageAsString) => {
             stats.inboundMessages += 1;
@@ -143,8 +191,12 @@ function createRelayServer(options = {}) {
                 }
 
                 if (data.type === 'join') {
+                    ws.relayAcceptsGzip = acceptsRelayGzip(data);
                     room.clients.add(ws);
-                    logger.log(`Neues Geraet beigetreten. Clients im Raum: ${room.clients.size}`);
+                    logger.log(
+                        `Neues Geraet beigetreten. Clients im Raum: ${room.clients.size}; `
+                        + `relay_gzip=${ws.relayAcceptsGzip ? 'yes' : 'no'}`
+                    );
                     return;
                 }
 
@@ -178,7 +230,9 @@ function createRelayServer(options = {}) {
             `[relay-stats] rooms=${rooms.size} clients=${totalClients()} `
             + `in_messages=${stats.inboundMessages} in_bytes=${stats.inboundBytes} `
             + `forwarded=${stats.forwardedMessages} copies=${stats.outboundCopies} `
-            + `out_bytes_raw=${stats.outboundBytesBeforeCompression} coalesced=${stats.coalescedTelemetry}`
+            + `out_bytes_raw=${stats.outboundBytesBeforeCompression} out_bytes_wire=${stats.outboundWireBytes} `
+            + `gzip_copies=${stats.gzipCopies} gzip_saved=${stats.gzipBytesSaved} gzip_errors=${stats.gzipErrors} `
+            + `coalesced=${stats.coalescedTelemetry}`
         );
         Object.keys(stats).forEach(key => { stats[key] = 0; });
     }, STATS_INTERVAL_MS);
@@ -205,7 +259,11 @@ if (require.main === module) createRelayServer();
 
 module.exports = {
     DEFAULT_TELEMETRY_INTERVAL_MS,
+    RELAY_GZIP_CAPABILITY,
+    RELAY_GZIP_MESSAGE_TYPE,
+    acceptsRelayGzip,
     createRelayServer,
+    createGzipEnvelope,
     isRealtimeTelemetry,
     mergePendingTelemetry
 };

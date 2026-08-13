@@ -1,7 +1,10 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
+const { gunzipSync } = require('node:zlib');
 const WebSocket = require('ws');
 const {
+    RELAY_GZIP_CAPABILITY,
+    RELAY_GZIP_MESSAGE_TYPE,
     createRelayServer,
     isRealtimeTelemetry,
     mergePendingTelemetry
@@ -26,6 +29,51 @@ test('classifies only continuous GPS packets as realtime telemetry', () => {
     assert.equal(isRealtimeTelemetry({ type: 'gps', commandOnly: true, trackerCommand: {} }), false);
     assert.equal(isRealtimeTelemetry({ type: 'gps', commandAckOnly: true }), false);
     assert.equal(isRealtimeTelemetry({ type: 'gps', trackerStatusOnly: true }), false);
+});
+
+test('compresses telemetry only for clients that opt in', async (t) => {
+    const silentLogger = { log() {}, error() {} };
+    const relay = createRelayServer({ port: 0, telemetryIntervalMs: 20, logger: silentLogger });
+    t.after(async () => relay.close());
+    await new Promise(resolve => relay.server.listening ? resolve() : relay.server.once('listening', resolve));
+
+    const address = relay.server.address();
+    const sender = await connect(`ws://127.0.0.1:${address.port}`);
+    const gzipReceiver = await connect(`ws://127.0.0.1:${address.port}`);
+    const legacyReceiver = await connect(`ws://127.0.0.1:${address.port}`);
+    t.after(() => sender.terminate());
+    t.after(() => gzipReceiver.terminate());
+    t.after(() => legacyReceiver.terminate());
+
+    const gzipMessages = [];
+    const legacyMessages = [];
+    gzipReceiver.on('message', raw => gzipMessages.push(JSON.parse(raw)));
+    legacyReceiver.on('message', raw => legacyMessages.push(JSON.parse(raw)));
+    const room = { syncId: 'gzip-test', pin: '5678' };
+    send(sender, { type: 'join', ...room });
+    send(gzipReceiver, { type: 'join', ...room, relayCapabilities: [RELAY_GZIP_CAPABILITY] });
+    send(legacyReceiver, { type: 'join', ...room });
+    await wait(20);
+
+    const telemetry = {
+        type: 'gps',
+        ...room,
+        lat: 48.123,
+        lon: 9.456,
+        flight: { gsKts: 100, repeated: 'telemetry-value-'.repeat(100) }
+    };
+    send(sender, telemetry);
+    await wait(60);
+
+    assert.equal(gzipMessages.length, 1);
+    assert.equal(gzipMessages[0].type, RELAY_GZIP_MESSAGE_TYPE);
+    assert.equal(gzipMessages[0].encoding, RELAY_GZIP_CAPABILITY);
+    const decoded = JSON.parse(gunzipSync(Buffer.from(gzipMessages[0].payload, 'base64')).toString('utf8'));
+    assert.deepEqual(decoded, telemetry);
+    assert.deepEqual(legacyMessages, [telemetry]);
+    assert.equal(relay.stats.gzipCopies, 1);
+    assert.ok(relay.stats.gzipBytesSaved > 0);
+    assert.ok(relay.stats.outboundWireBytes < relay.stats.outboundBytesBeforeCompression);
 });
 
 test('keeps a one-shot traffic snapshot while replacing queued telemetry', () => {
